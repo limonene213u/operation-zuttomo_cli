@@ -7,10 +7,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, Stdio};
+use std::sync::{
+    mpsc::{self, Sender},
+    Arc, Mutex,
+};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -108,6 +111,13 @@ struct Config {
     history_path: String,
     pair_host: String,
     pair_port: u16,
+    pair_public_url: String,
+    pair_token: Option<String>,
+    pair_reverse_tunnel_enabled: bool,
+    pair_reverse_tunnel_ssh: String,
+    pair_reverse_tunnel_key: Option<String>,
+    pair_reverse_tunnel_host_key_alias: Option<String>,
+    pair_autostart: bool,
     http_timeout_secs: u64,
     oss_url: String,
 }
@@ -145,7 +155,21 @@ impl Config {
             pair_port: env::var("ZUTTOMO_PAIR_PORT")
                 .ok()
                 .and_then(|port| port.parse().ok())
-                .unwrap_or(8787),
+                .unwrap_or(8080),
+            pair_public_url: env::var("ZUTTOMO_PAIR_PUBLIC_URL")
+                .unwrap_or_else(|_| "https://zuttomo-test.aets-hiroshima.org".to_string()),
+            pair_token: env_nonempty("ZUTTOMO_PAIR_TOKEN"),
+            pair_reverse_tunnel_enabled: env_bool("ZUTTOMO_PAIR_REVERSE_TUNNEL", true),
+            pair_reverse_tunnel_ssh: env::var("ZUTTOMO_PAIR_REVERSE_TUNNEL_SSH")
+                .unwrap_or_else(|_| "ubuntu@100.119.206.15".to_string()),
+            pair_reverse_tunnel_key: env_nonempty("ZUTTOMO_PAIR_REVERSE_TUNNEL_KEY")
+                .or_else(|| env_nonempty("ZUTTOMO_PAIR_SSH_KEY"))
+                .or_else(|| Some("~/.ssh/id_rsa-ansible".to_string())),
+            pair_reverse_tunnel_host_key_alias: env_nonempty(
+                "ZUTTOMO_PAIR_REVERSE_TUNNEL_HOST_KEY_ALIAS",
+            )
+            .or_else(|| Some("153.127.64.95".to_string())),
+            pair_autostart: env_bool("ZUTTOMO_PAIR_AUTOSTART", true),
             http_timeout_secs: env::var("ZUTTOMO_HTTP_TIMEOUT_SECS")
                 .ok()
                 .and_then(|secs| secs.parse().ok())
@@ -156,9 +180,29 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PairServer {
+    urls: Vec<PairUrl>,
+    warnings: Vec<String>,
+    _reverse_tunnel: Option<PairReverseTunnel>,
+}
+
+#[derive(Debug)]
+struct PairUrl {
+    label: &'static str,
     url: String,
+}
+
+#[derive(Debug)]
+struct PairReverseTunnel {
+    child: Child,
+}
+
+impl Drop for PairReverseTunnel {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn env_bool(name: &str, default: bool) -> bool {
@@ -535,14 +579,149 @@ fn local_ip_guess() -> Option<String> {
     Some(socket.local_addr().ok()?.ip().to_string())
 }
 
-fn pair_display_url(host: &str, port: u16) -> String {
-    let display_host = if host == "0.0.0.0" || host == "::" {
-        local_ip_guess().unwrap_or_else(|| "127.0.0.1".to_string())
+fn is_wildcard_host(host: &str) -> bool {
+    host == "0.0.0.0" || host == "::" || host == "[::]"
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
+}
+
+fn url_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
     } else {
         host.to_string()
-    };
+    }
+}
 
-    format!("http://{display_host}:{port}")
+fn pair_base_url(host: &str, port: u16) -> String {
+    format!("http://{}:{port}", url_host(host))
+}
+
+fn pair_lan_base_url(host: &str, port: u16) -> Option<String> {
+    if is_wildcard_host(host) {
+        let ip = local_ip_guess()?;
+        if is_loopback_host(&ip) {
+            None
+        } else {
+            Some(pair_base_url(&ip, port))
+        }
+    } else if is_loopback_host(host) {
+        None
+    } else {
+        Some(pair_base_url(host, port))
+    }
+}
+
+fn pair_url(base_url: &str, token: &str) -> String {
+    if base_url.contains("{token}") {
+        base_url.replace("{token}", token)
+    } else {
+        base_url.trim_end_matches('/').to_string()
+    }
+}
+
+fn pair_page_path(token: &str) -> String {
+    format!("/t/{token}")
+}
+
+fn pair_submit_path(token: &str) -> String {
+    format!("/t/{token}/submit")
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+
+    out
+}
+
+fn generate_pair_token() -> String {
+    let mut bytes = [0u8; 16];
+    if File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok()
+    {
+        return hex_encode(&bytes);
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{:x}{:x}", now, std::process::id())
+}
+
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+
+    path.to_string()
+}
+
+fn start_pair_reverse_tunnel(cfg: &Config) -> Result<Option<PairReverseTunnel>> {
+    if !cfg.pair_reverse_tunnel_enabled {
+        return Ok(None);
+    }
+
+    let remote_forward = format!("127.0.0.1:{port}:127.0.0.1:{port}", port = cfg.pair_port);
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-N")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("ServerAliveInterval=30")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+
+    if let Some(alias) = &cfg.pair_reverse_tunnel_host_key_alias {
+        cmd.arg("-o").arg(format!("HostKeyAlias={alias}"));
+    }
+
+    if let Some(key) = &cfg.pair_reverse_tunnel_key {
+        cmd.arg("-i").arg(expand_tilde(key));
+    }
+
+    cmd.arg("-R")
+        .arg(remote_forward)
+        .arg(&cfg.pair_reverse_tunnel_ssh)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .context("failed to start pair reverse SSH tunnel")?;
+
+    thread::sleep(Duration::from_millis(600));
+    if let Some(status) = child
+        .try_wait()
+        .context("failed to check pair reverse SSH tunnel")?
+    {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        bail!(
+            "pair reverse SSH tunnel exited with {status}: {}",
+            stderr.trim()
+        );
+    }
+
+    Ok(Some(PairReverseTunnel { child }))
 }
 
 fn html_escape(text: &str) -> String {
@@ -609,11 +788,12 @@ fn parse_form_text(body: &str) -> Option<String> {
     None
 }
 
-fn pair_form_page(latest_text: Option<&str>, oss_url: &str) -> String {
+fn pair_form_page(latest_text: Option<&str>, oss_url: &str, token: &str) -> String {
     let latest = latest_text
         .map(html_escape)
         .unwrap_or_else(|| "まだ入力はありません。".to_string());
     let oss_url = html_escape(oss_url);
+    let submit_path = html_escape(&pair_submit_path(token));
 
     format!(
         r#"<!doctype html>
@@ -634,7 +814,7 @@ button {{ width: 100%; margin-top: 12px; padding: 14px; font-size: 18px; }}
 <body>
 <h1>檸檬烯姐智慧板</h1>
 <p>請用你的手機輸入中文。りもこ這邊會翻譯成日文。</p>
-<form method="post" action="/submit">
+<form method="post" action="{submit_path}">
 <textarea name="text" autofocus placeholder="請在這裡輸入中文"></textarea>
 <button type="submit">送出</button>
 </form>
@@ -658,10 +838,19 @@ fn write_http_response(stream: &mut TcpStream, status: &str, content_type: &str,
     let _ = stream.write_all(response.as_bytes());
 }
 
+fn request_method_path(request_line: &str) -> Option<(&str, &str)> {
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?.split('?').next().unwrap_or("");
+    Some((method, path))
+}
+
 fn handle_pair_client(
     mut stream: TcpStream,
     latest_partner_input: Arc<Mutex<Option<String>>>,
     oss_url: String,
+    token: String,
+    input_tx: Sender<String>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -688,29 +877,47 @@ fn handle_pair_client(
             .and_then(|guard| guard.clone())
     };
 
-    if request_line.starts_with("GET / ") || request_line.starts_with("GET / HTTP/") {
-        let page = pair_form_page(latest_text().as_deref(), &oss_url);
+    let (method, path) = match request_method_path(&request_line) {
+        Some(parts) => parts,
+        None => {
+            write_http_response(&mut stream, "400 Bad Request", "text/plain", "bad request");
+            return Ok(());
+        }
+    };
+
+    let page_path = pair_page_path(&token);
+    let page_path_slash = format!("{page_path}/");
+    let submit_path = pair_submit_path(&token);
+
+    if method == "GET" && (path == "/" || path == page_path || path == page_path_slash) {
+        let page = pair_form_page(latest_text().as_deref(), &oss_url, &token);
         write_http_response(&mut stream, "200 OK", "text/html", &page);
         return Ok(());
     }
 
-    if request_line.starts_with("POST /submit ") || request_line.starts_with("POST /submit HTTP/") {
+    if method == "POST" && (path == "/submit" || path == submit_path) {
         let mut body = vec![0; content_length];
         reader.read_exact(&mut body)?;
         let body = String::from_utf8_lossy(&body);
 
         let message = if let Some(text) = parse_form_text(&body) {
             if let Ok(mut latest) = latest_partner_input.lock() {
-                *latest = Some(text);
+                *latest = Some(text.clone());
             }
-            "收到！請回到りもこ的CLI輸入 /you。"
+            let _ = input_tx.send(text.clone());
+            println!();
+            println!("[pair] WebUI input received:");
+            println!("{text}");
+            println!("[pair] CLIに自動送信しました。");
+            let _ = io::stdout().flush();
+            "收到！CLIへ送信しました。"
         } else {
             "沒有收到文字，請再試一次。"
         };
 
         let page = format!(
             "{}<p><strong>{}</strong></p>",
-            pair_form_page(latest_text().as_deref(), &oss_url),
+            pair_form_page(latest_text().as_deref(), &oss_url, &token),
             html_escape(message)
         );
         write_http_response(&mut stream, "200 OK", "text/html", &page);
@@ -724,12 +931,42 @@ fn handle_pair_client(
 fn start_pair_server(
     cfg: &Config,
     latest_partner_input: Arc<Mutex<Option<String>>>,
+    input_tx: Sender<String>,
 ) -> Result<PairServer> {
     let bind_addr = format!("{}:{}", cfg.pair_host, cfg.pair_port);
     let listener = TcpListener::bind(&bind_addr)
         .with_context(|| format!("failed to bind pair server on {bind_addr}"))?;
-    let url = pair_display_url(&cfg.pair_host, cfg.pair_port);
+    let token = cfg.pair_token.clone().unwrap_or_else(generate_pair_token);
     let oss_url = cfg.oss_url.clone();
+    let mut urls = Vec::new();
+    let mut warnings = Vec::new();
+
+    urls.push(PairUrl {
+        label: "public",
+        url: pair_url(&cfg.pair_public_url, &token),
+    });
+
+    if is_wildcard_host(&cfg.pair_host) || is_loopback_host(&cfg.pair_host) {
+        urls.push(PairUrl {
+            label: "local",
+            url: pair_url(&pair_base_url("127.0.0.1", cfg.pair_port), &token),
+        });
+    }
+
+    if let Some(base_url) = pair_lan_base_url(&cfg.pair_host, cfg.pair_port) {
+        urls.push(PairUrl {
+            label: "LAN/Tailscale",
+            url: pair_url(&base_url, &token),
+        });
+    }
+
+    let reverse_tunnel = match start_pair_reverse_tunnel(cfg) {
+        Ok(tunnel) => tunnel,
+        Err(error) => {
+            warnings.push(format!("pair reverse SSH tunnel failed: {error:#}"));
+            None
+        }
+    };
 
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -737,8 +974,16 @@ fn start_pair_server(
                 Ok(stream) => {
                     let latest_partner_input = Arc::clone(&latest_partner_input);
                     let oss_url = oss_url.clone();
+                    let token = token.clone();
+                    let input_tx = input_tx.clone();
                     thread::spawn(move || {
-                        let _ = handle_pair_client(stream, latest_partner_input, oss_url);
+                        let _ = handle_pair_client(
+                            stream,
+                            latest_partner_input,
+                            oss_url,
+                            token,
+                            input_tx,
+                        );
                     });
                 }
                 Err(error) => eprintln!("pair server accept failed: {error}"),
@@ -746,7 +991,11 @@ fn start_pair_server(
         }
     });
 
-    Ok(PairServer { url })
+    Ok(PairServer {
+        urls,
+        warnings,
+        _reverse_tunnel: reverse_tunnel,
+    })
 }
 
 fn command_arg<'a>(input: &'a str, command: &str) -> Option<&'a str> {
@@ -819,8 +1068,36 @@ fn print_help(backend: Backend, mode: Mode, cfg: &Config) {
     println!("  ZUTTOMO_HISTORY={}", cfg.history_path);
     println!("  ZUTTOMO_PAIR_HOST={}", cfg.pair_host);
     println!("  ZUTTOMO_PAIR_PORT={}", cfg.pair_port);
+    println!("  ZUTTOMO_PAIR_PUBLIC_URL={}", cfg.pair_public_url);
+    println!(
+        "  ZUTTOMO_PAIR_TOKEN={}",
+        if cfg.pair_token.is_some() {
+            "<set>"
+        } else {
+            "<generated>"
+        }
+    );
+    println!(
+        "  ZUTTOMO_PAIR_REVERSE_TUNNEL={}",
+        cfg.pair_reverse_tunnel_enabled
+    );
+    println!(
+        "  ZUTTOMO_PAIR_REVERSE_TUNNEL_SSH={}",
+        cfg.pair_reverse_tunnel_ssh
+    );
+    println!("  ZUTTOMO_PAIR_AUTOSTART={}", cfg.pair_autostart);
     println!("  ZUTTOMO_HTTP_TIMEOUT_SECS={}", cfg.http_timeout_secs);
     println!("  ZUTTOMO_OSS_URL={}", cfg.oss_url);
+}
+
+fn print_pair_server(server: &PairServer) {
+    for pair_url in &server.urls {
+        println!("{}: {}", pair_url.label, pair_url.url);
+    }
+
+    for warning in &server.warnings {
+        println!("warning: {warning}");
+    }
 }
 
 fn preview(text: &str, max_chars: usize) -> String {
@@ -893,6 +1170,34 @@ fn run_turn(
     Ok(answer)
 }
 
+fn run_turn_shared(
+    cfg: &Config,
+    client: &Client,
+    backend: Backend,
+    history: &Arc<Mutex<Vec<Message>>>,
+    mode: Mode,
+    input: &str,
+) -> Result<String> {
+    let history_snapshot = {
+        history
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    };
+    let answer = ask_backend(cfg, client, backend, &history_snapshot, mode, input)?;
+    let user_msg = Message::new("user", mode, input);
+    let assistant_msg = Message::new("assistant", mode, answer.clone());
+
+    append_history(&cfg.history_path, &user_msg)?;
+    append_history(&cfg.history_path, &assistant_msg)?;
+    if let Ok(mut guard) = history.lock() {
+        guard.push(user_msg);
+        guard.push(assistant_msg);
+    }
+
+    Ok(answer)
+}
+
 fn execute_turn(
     cfg: &Config,
     client: &Client,
@@ -933,16 +1238,46 @@ fn run_repl() -> Result<()> {
         .timeout(Duration::from_secs(cfg.http_timeout_secs))
         .build()
         .context("failed to build HTTP client")?;
-    let mut backend = cfg.default_backend;
-    let mut mode = Mode::Chat;
-    let mut history = load_history(&cfg.history_path);
+    let backend = Arc::new(Mutex::new(cfg.default_backend));
+    let mode = Arc::new(Mutex::new(Mode::Chat));
+    let history = Arc::new(Mutex::new(load_history(&cfg.history_path)));
     let latest_partner_input = Arc::new(Mutex::new(None));
+    let (pair_tx, pair_rx) = mpsc::channel::<String>();
     let mut pair_server: Option<PairServer> = None;
 
-    print_banner(backend, mode, history.len());
+    spawn_pair_translation_worker(
+        cfg.clone(),
+        client.clone(),
+        Arc::clone(&backend),
+        Arc::clone(&history),
+        pair_rx,
+    );
+
+    let initial_backend = backend.lock().map(|guard| *guard).unwrap_or(cfg.default_backend);
+    let initial_mode = mode.lock().map(|guard| *guard).unwrap_or(Mode::Chat);
+    let initial_history_len = history.lock().map(|guard| guard.len()).unwrap_or(0);
+    print_banner(initial_backend, initial_mode, initial_history_len);
+
+    if cfg.pair_autostart {
+        match start_pair_server(&cfg, Arc::clone(&latest_partner_input), pair_tx.clone()) {
+            Ok(server) => {
+                println!("pair server auto-started:");
+                print_pair_server(&server);
+                pair_server = Some(server);
+                println!();
+            }
+            Err(error) => {
+                println!("pair server auto-start failed: {error:#}");
+                println!("CLIは継続します。必要なら /pair を再実行してください。");
+                println!();
+            }
+        }
+    }
 
     loop {
-        print!("[{}:{}] ㄅㄆㄇㄈ> ", backend.name(), mode.name());
+        let current_backend = backend.lock().map(|guard| *guard).unwrap_or(cfg.default_backend);
+        let current_mode = mode.lock().map(|guard| *guard).unwrap_or(Mode::Chat);
+        print!("[{}:{}] ㄅㄆㄇㄈ> ", current_backend.name(), current_mode.name());
         io::stdout().flush()?;
 
         let mut line = String::new();
@@ -962,7 +1297,7 @@ fn run_repl() -> Result<()> {
         }
 
         if input == "/help" {
-            print_help(backend, mode, &cfg);
+            print_help(current_backend, current_mode, &cfg);
             continue;
         }
 
@@ -973,15 +1308,20 @@ fn run_repl() -> Result<()> {
 
         if let Some(rest) = command_arg(input, "/model") {
             if rest.is_empty() {
-                println!("current backend: {}", backend.name());
+                println!(
+                    "current backend: {}",
+                    backend.lock().map(|guard| guard.name()).unwrap_or("codex")
+                );
                 println!("available: mi25, openrouter, codex");
             } else if let Some(new_backend) = Backend::from_name(rest) {
                 if new_backend == Backend::Mi25 && !cfg.mi25_enabled {
                     println!("MI25 backend is disabled.");
                     println!("ZUTTOMO_MI25_ENABLED=true にすると有効化できます。");
                 } else {
-                    backend = new_backend;
-                    println!("backend switched: {}", backend.name());
+                    if let Ok(mut guard) = backend.lock() {
+                        *guard = new_backend;
+                    }
+                    println!("backend switched: {}", new_backend.name());
                 }
             } else {
                 println!("unknown backend: {rest}");
@@ -991,18 +1331,22 @@ fn run_repl() -> Result<()> {
         }
 
         if input == "/history" {
-            print_history(&history, 30);
+            if let Ok(guard) = history.lock() {
+                print_history(&guard, 30);
+            }
             continue;
         }
 
         if input == "/clear" {
-            history.clear();
+            if let Ok(mut guard) = history.lock() {
+                guard.clear();
+            }
             println!("memory history cleared. history file was not deleted.");
             continue;
         }
 
         if input == "/prompt" {
-            println!("{}", system_prompt(mode).trim());
+            println!("{}", system_prompt(current_mode).trim());
             continue;
         }
 
@@ -1012,9 +1356,12 @@ fn run_repl() -> Result<()> {
             } else {
                 rest
             };
-            match export_markdown(target, &history) {
-                Ok(()) => println!("exported: {target}"),
-                Err(error) => println!("export failed: {error:#}"),
+            match history.lock() {
+                Ok(guard) => match export_markdown(target, &guard) {
+                    Ok(()) => println!("exported: {target}"),
+                    Err(error) => println!("export failed: {error:#}"),
+                },
+                Err(_) => println!("export failed: history lock poisoned"),
             }
             continue;
         }
@@ -1022,13 +1369,13 @@ fn run_repl() -> Result<()> {
         if input == "/pair" {
             if let Some(server) = &pair_server {
                 println!("pair server is already running:");
-                println!("{}", server.url);
+                print_pair_server(server);
             } else {
-                match start_pair_server(&cfg, Arc::clone(&latest_partner_input)) {
+                match start_pair_server(&cfg, Arc::clone(&latest_partner_input), pair_tx.clone()) {
                     Ok(server) => {
                         println!("請用你的手機輸入中文。");
                         println!("我這邊會自動翻譯成日文。");
-                        println!("{}", server.url);
+                        print_pair_server(&server);
                         pair_server = Some(server);
                     }
                     Err(error) => {
@@ -1041,79 +1388,149 @@ fn run_repl() -> Result<()> {
         }
 
         if let Some(rest) = command_arg(input, "/chat") {
-            mode = Mode::Chat;
+            if let Ok(mut guard) = mode.lock() {
+                *guard = Mode::Chat;
+            }
             if rest.is_empty() {
-                println!("mode switched: {}", mode.name());
+                println!("mode switched: {}", Mode::Chat.name());
             } else {
-                execute_turn(&cfg, &client, backend, &mut history, mode, rest);
+                execute_turn_shared(
+                    &cfg,
+                    &client,
+                    current_backend,
+                    &history,
+                    Mode::Chat,
+                    rest,
+                );
             }
             continue;
         }
 
         if let Some(rest) = command_arg(input, "/question") {
-            mode = Mode::Question;
+            if let Ok(mut guard) = mode.lock() {
+                *guard = Mode::Question;
+            }
             if rest.is_empty() {
-                println!("mode switched: {}", mode.name());
+                println!("mode switched: {}", Mode::Question.name());
             } else {
-                execute_turn(&cfg, &client, backend, &mut history, mode, rest);
+                execute_turn_shared(
+                    &cfg,
+                    &client,
+                    current_backend,
+                    &history,
+                    Mode::Question,
+                    rest,
+                );
             }
             continue;
         }
 
         if let Some(rest) = command_arg(input, "/tw") {
-            mode = Mode::ToTaiwanMandarin;
+            if let Ok(mut guard) = mode.lock() {
+                *guard = Mode::ToTaiwanMandarin;
+            }
             if rest.is_empty() {
-                println!("mode switched: {}", mode.name());
+                println!("mode switched: {}", Mode::ToTaiwanMandarin.name());
             } else {
-                execute_turn(&cfg, &client, backend, &mut history, mode, rest);
+                execute_turn_shared(
+                    &cfg,
+                    &client,
+                    current_backend,
+                    &history,
+                    Mode::ToTaiwanMandarin,
+                    rest,
+                );
             }
             continue;
         }
 
         if let Some(rest) = command_arg(input, "/me") {
-            mode = Mode::ToTaiwanMandarin;
+            if let Ok(mut guard) = mode.lock() {
+                *guard = Mode::ToTaiwanMandarin;
+            }
             if rest.is_empty() {
                 println!("usage: /me TEXT");
             } else {
-                execute_turn(&cfg, &client, backend, &mut history, mode, rest);
+                execute_turn_shared(
+                    &cfg,
+                    &client,
+                    current_backend,
+                    &history,
+                    Mode::ToTaiwanMandarin,
+                    rest,
+                );
             }
             continue;
         }
 
         if let Some(rest) = command_arg(input, "/jp") {
-            mode = Mode::ToJapanese;
+            if let Ok(mut guard) = mode.lock() {
+                *guard = Mode::ToJapanese;
+            }
             if rest.is_empty() {
-                println!("mode switched: {}", mode.name());
+                println!("mode switched: {}", Mode::ToJapanese.name());
             } else {
-                execute_turn(&cfg, &client, backend, &mut history, mode, rest);
+                execute_turn_shared(
+                    &cfg,
+                    &client,
+                    current_backend,
+                    &history,
+                    Mode::ToJapanese,
+                    rest,
+                );
             }
             continue;
         }
 
         if let Some(rest) = command_arg(input, "/you") {
-            mode = Mode::ToJapanese;
+            if let Ok(mut guard) = mode.lock() {
+                *guard = Mode::ToJapanese;
+            }
             if rest.is_empty() {
                 let partner_input = latest_partner_input
                     .lock()
                     .ok()
                     .and_then(|latest| latest.clone());
                 if let Some(partner_input) = partner_input {
-                    execute_turn(&cfg, &client, backend, &mut history, mode, &partner_input);
+                    execute_turn_shared(
+                        &cfg,
+                        &client,
+                        current_backend,
+                        &history,
+                        Mode::ToJapanese,
+                        &partner_input,
+                    );
                 } else {
                     println!("相手スマホ入力はまだありません。今は /you TEXT を使ってください。");
                 }
             } else {
-                execute_turn(&cfg, &client, backend, &mut history, mode, rest);
+                execute_turn_shared(
+                    &cfg,
+                    &client,
+                    current_backend,
+                    &history,
+                    Mode::ToJapanese,
+                    rest,
+                );
             }
             continue;
         }
 
         if let Some(rest) = command_arg(input, "/pobo") {
-            mode = Mode::Pobo;
+            if let Ok(mut guard) = mode.lock() {
+                *guard = Mode::Pobo;
+            }
             if rest.is_empty() {
-                println!("mode switched: {}", mode.name());
+                println!("mode switched: {}", Mode::Pobo.name());
             } else {
-                execute_turn(&cfg, &client, backend, &mut history, mode, rest);
+                execute_turn_shared(
+                    &cfg,
+                    &client,
+                    current_backend,
+                    &history,
+                    Mode::Pobo,
+                    rest,
+                );
             }
             continue;
         }
@@ -1124,7 +1541,7 @@ fn run_repl() -> Result<()> {
             continue;
         }
 
-        execute_turn(&cfg, &client, backend, &mut history, mode, input);
+        execute_turn_shared(&cfg, &client, current_backend, &history, current_mode, input);
     }
 
     Ok(())
@@ -1149,6 +1566,46 @@ fn main() -> Result<()> {
             bail!("unknown zuttomo option: {}", args.join(" "));
         }
     }
+}
+
+fn execute_turn_shared(
+    cfg: &Config,
+    client: &Client,
+    backend: Backend,
+    history: &Arc<Mutex<Vec<Message>>>,
+    mode: Mode,
+    input: &str,
+) {
+    match run_turn_shared(cfg, client, backend, history, mode, input) {
+        Ok(answer) => {
+            println!();
+            println!("{answer}");
+            println!();
+        }
+        Err(error) => print_backend_error(backend, &error),
+    }
+}
+
+fn spawn_pair_translation_worker(
+    cfg: Config,
+    client: Client,
+    backend: Arc<Mutex<Backend>>,
+    history: Arc<Mutex<Vec<Message>>>,
+    rx: mpsc::Receiver<String>,
+) {
+    thread::spawn(move || {
+        for text in rx {
+            let backend_now = backend.lock().map(|guard| *guard).unwrap_or(cfg.default_backend);
+            execute_turn_shared(
+                &cfg,
+                &client,
+                backend_now,
+                &history,
+                Mode::ToJapanese,
+                &text,
+            );
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1190,6 +1647,26 @@ mod tests {
         assert_eq!(
             parse_form_text("text=hello+world").as_deref(),
             Some("hello world")
+        );
+    }
+
+    #[test]
+    fn pair_url_adds_token_path() {
+        assert_eq!(
+            pair_url("https://pair.example.com/", "abc123"),
+            "https://pair.example.com"
+        );
+        assert_eq!(
+            pair_url("https://pair.example.com/{token}", "abc123"),
+            "https://pair.example.com/abc123"
+        );
+    }
+
+    #[test]
+    fn request_method_path_ignores_query() {
+        assert_eq!(
+            request_method_path("GET /t/abc123?x=1 HTTP/1.1"),
+            Some(("GET", "/t/abc123"))
         );
     }
 }
