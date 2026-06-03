@@ -1,0 +1,10 @@
+.env
+CODEX.md
+CLAUDE.md
+MEMO.md
+PLAN.md
+SPEC.md
+FEEDBACK.md
+target/
+zuttomo-history.jsonl
+zuttomo-history.md
