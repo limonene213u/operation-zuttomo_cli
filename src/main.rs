@@ -1,7 +1,10 @@
 use anyhow::{bail, Context, Result};
+use hmac::{Hmac, Mac};
 use reqwest::blocking::Client;
+use rustyline::error::ReadlineError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -14,6 +17,11 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+type HmacSha256 = Hmac<sha2::Sha256>;
+
+const DEFAULT_PAIR_AUTH_CODE_TTL_SECS: u64 = 90;
+const MAX_PAIR_SESSION_TTL_SECS: u64 = 5 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -118,6 +126,10 @@ struct Config {
     pair_reverse_tunnel_key: Option<String>,
     pair_reverse_tunnel_host_key_alias: Option<String>,
     pair_autostart: bool,
+    pair_onetime_ttl_secs: u64,
+    pair_session_ttl_secs: u64,
+    pair_auth_max_attempts: u32,
+    pair_auth_lockout_secs: u64,
     http_timeout_secs: u64,
     oss_url: String,
 }
@@ -170,6 +182,17 @@ impl Config {
             )
             .or_else(|| Some("153.127.64.95".to_string())),
             pair_autostart: env_bool("ZUTTOMO_PAIR_AUTOSTART", true),
+            pair_onetime_ttl_secs: env_u64(
+                "ZUTTOMO_PAIR_ONETIME_TTL_SECS",
+                DEFAULT_PAIR_AUTH_CODE_TTL_SECS,
+            ),
+            pair_session_ttl_secs: env_u64(
+                "ZUTTOMO_PAIR_SESSION_TTL_SECS",
+                MAX_PAIR_SESSION_TTL_SECS,
+            )
+            .min(MAX_PAIR_SESSION_TTL_SECS),
+            pair_auth_max_attempts: env_u32("ZUTTOMO_PAIR_AUTH_MAX_ATTEMPTS", 8),
+            pair_auth_lockout_secs: env_u64("ZUTTOMO_PAIR_AUTH_LOCKOUT_SECS", 60),
             http_timeout_secs: env::var("ZUTTOMO_HTTP_TIMEOUT_SECS")
                 .ok()
                 .and_then(|secs| secs.parse().ok())
@@ -205,6 +228,172 @@ impl Drop for PairReverseTunnel {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthCode {
+    value: String,
+    expires_in_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PairBubble {
+    speaker: String,
+    kind: String,
+    owner_session: Option<String>,
+    body: String,
+}
+
+#[derive(Debug, Clone)]
+struct PairInput {
+    speaker: String,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct AuthAttempt {
+    failures: u32,
+    locked_until: u64,
+}
+
+#[derive(Debug)]
+struct OneTimeAuth {
+    secret: Vec<u8>,
+    sessions: HashMap<String, u64>,
+    attempts: HashMap<String, AuthAttempt>,
+    code_ttl_secs: u64,
+    session_ttl_secs: u64,
+    max_attempts: u32,
+    lockout_secs: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OneTimeAuthResult {
+    Success {
+        session_id: String,
+        max_age_secs: u64,
+    },
+    Invalid,
+    Locked {
+        retry_after_secs: u64,
+    },
+}
+
+impl OneTimeAuth {
+    fn new(
+        code_ttl_secs: u64,
+        session_ttl_secs: u64,
+        max_attempts: u32,
+        lockout_secs: u64,
+    ) -> Self {
+        Self::with_secret(
+            generate_auth_secret().to_vec(),
+            code_ttl_secs,
+            session_ttl_secs,
+            max_attempts,
+            lockout_secs,
+        )
+    }
+
+    fn with_secret(
+        secret: Vec<u8>,
+        code_ttl_secs: u64,
+        session_ttl_secs: u64,
+        max_attempts: u32,
+        lockout_secs: u64,
+    ) -> Self {
+        Self {
+            secret,
+            sessions: HashMap::new(),
+            attempts: HashMap::new(),
+            code_ttl_secs: code_ttl_secs.max(1),
+            session_ttl_secs: session_ttl_secs.min(MAX_PAIR_SESSION_TTL_SECS),
+            max_attempts: max_attempts.max(1),
+            lockout_secs,
+        }
+    }
+
+    fn current_code(&self) -> AuthCode {
+        self.current_code_at(now_secs())
+    }
+
+    fn current_code_at(&self, now: u64) -> AuthCode {
+        let window = now / self.code_ttl_secs;
+        let expires_in_secs = self.code_ttl_secs - (now % self.code_ttl_secs);
+        AuthCode {
+            value: auth_code_for_window(&self.secret, window),
+            expires_in_secs,
+        }
+    }
+
+    fn verify_code(&mut self, input: &str, client_id: &str) -> OneTimeAuthResult {
+        self.verify_code_at(input, client_id, now_secs())
+    }
+
+    fn verify_code_at(&mut self, input: &str, client_id: &str, now: u64) -> OneTimeAuthResult {
+        self.prune(now);
+
+        if let Some(attempt) = self.attempts.get(client_id) {
+            if attempt.locked_until > now {
+                return OneTimeAuthResult::Locked {
+                    retry_after_secs: attempt.locked_until.saturating_sub(now),
+                };
+            }
+        }
+
+        if !is_onetime_code(input) || input != self.current_code_at(now).value {
+            self.record_failure(client_id, now);
+            return OneTimeAuthResult::Invalid;
+        }
+
+        let session_id = generate_pair_token();
+        self.sessions.insert(
+            session_id.clone(),
+            now.saturating_add(self.session_ttl_secs),
+        );
+        self.attempts.remove(client_id);
+
+        OneTimeAuthResult::Success {
+            session_id,
+            max_age_secs: self.session_ttl_secs,
+        }
+    }
+
+    fn is_session_authenticated(&mut self, cookie_header: Option<&str>) -> bool {
+        self.is_session_authenticated_at(cookie_header, now_secs())
+    }
+
+    fn is_session_authenticated_at(&mut self, cookie_header: Option<&str>, now: u64) -> bool {
+        self.prune(now);
+        let Some(session_id) = cookie_value(cookie_header, PAIR_SESSION_COOKIE) else {
+            return false;
+        };
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|expires_at| *expires_at > now)
+    }
+
+    fn record_failure(&mut self, client_id: &str, now: u64) {
+        let attempt = self
+            .attempts
+            .entry(client_id.to_string())
+            .or_insert(AuthAttempt {
+                failures: 0,
+                locked_until: 0,
+            });
+        attempt.failures = attempt.failures.saturating_add(1);
+
+        if attempt.failures >= self.max_attempts {
+            attempt.failures = 0;
+            attempt.locked_until = now.saturating_add(self.lockout_secs);
+        }
+    }
+
+    fn prune(&mut self, now: u64) {
+        self.sessions.retain(|_, expires_at| *expires_at > now);
+        self.attempts
+            .retain(|_, attempt| attempt.locked_until == 0 || attempt.locked_until > now);
+    }
+}
+
 fn env_bool(name: &str, default: bool) -> bool {
     match env::var(name) {
         Ok(value) => match value.trim().to_lowercase().as_str() {
@@ -214,6 +403,20 @@ fn env_bool(name: &str, default: bool) -> bool {
         },
         Err(_) => default,
     }
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -630,6 +833,23 @@ fn pair_submit_path(token: &str) -> String {
     format!("/t/{token}/submit")
 }
 
+fn pair_auth_path(token: &str) -> String {
+    format!("/t/{token}/auth")
+}
+
+fn pair_state_path(token: &str) -> String {
+    format!("/t/{token}/state")
+}
+
+const PAIR_SESSION_COOKIE: &str = "zuttomo_pair_session";
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -656,6 +876,46 @@ fn generate_pair_token() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{:x}{:x}", now, std::process::id())
+}
+
+fn generate_auth_secret() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    if File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_err()
+    {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_ne_bytes();
+        for (idx, byte) in now.iter().enumerate() {
+            bytes[idx] ^= *byte;
+        }
+
+        let pid = std::process::id().to_ne_bytes();
+        for (idx, byte) in pid.iter().enumerate() {
+            bytes[16 + idx] ^= *byte;
+        }
+    }
+
+    bytes
+}
+
+fn auth_code_for_window(secret: &[u8], window: u64) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts keys of any size");
+    mac.update(&window.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let offset = (digest[digest.len() - 1] & 0x0f) as usize;
+    let value = ((u32::from(digest[offset]) & 0x7f) << 24)
+        | (u32::from(digest[offset + 1]) << 16)
+        | (u32::from(digest[offset + 2]) << 8)
+        | u32::from(digest[offset + 3]);
+    format!("{:08}", value % 100_000_000)
+}
+
+fn is_onetime_code(input: &str) -> bool {
+    input.len() == 8 && input.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -773,14 +1033,12 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn parse_form_text(body: &str) -> Option<String> {
+fn parse_form_field(body: &str, name: &str) -> Option<String> {
     for pair in body.split('&') {
         if let Some((key, value)) = pair.split_once('=') {
-            if key == "text" {
-                let text = percent_decode(value).trim().to_string();
-                if !text.is_empty() {
-                    return Some(text);
-                }
+            if key == name {
+                let value = percent_decode(value).trim().to_string();
+                return Some(value);
             }
         }
     }
@@ -788,12 +1046,190 @@ fn parse_form_text(body: &str) -> Option<String> {
     None
 }
 
-fn pair_form_page(latest_text: Option<&str>, oss_url: &str, token: &str) -> String {
+fn parse_form_text(body: &str) -> Option<String> {
+    parse_form_field(body, "text").filter(|text| !text.is_empty())
+}
+
+fn parse_form_onetime_code(body: &str) -> Option<String> {
+    parse_form_field(body, "code").filter(|code| is_onetime_code(code))
+}
+
+fn pair_speaker_label(session_id: Option<&str>, client_id: &str) -> String {
+    if let Some(session_id) = session_id {
+        let short = session_id.chars().take(6).collect::<String>();
+        return format!("相手 {short}");
+    }
+
+    format!("相手 {client_id}")
+}
+
+fn cookie_value(cookie_header: Option<&str>, name: &str) -> Option<String> {
+    let cookie_header = cookie_header?;
+
+    for cookie in cookie_header.split(';') {
+        if let Some((key, value)) = cookie.trim().split_once('=') {
+            if key == name && !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn push_pair_bubble(
+    pair_bubbles: &Arc<Mutex<Vec<PairBubble>>>,
+    speaker: &str,
+    kind: &str,
+    owner_session: Option<String>,
+    body: impl Into<String>,
+) {
+    if let Ok(mut bubbles) = pair_bubbles.lock() {
+        bubbles.push(PairBubble {
+            speaker: speaker.to_string(),
+            kind: kind.to_string(),
+            owner_session,
+            body: body.into(),
+        });
+
+        let start = bubbles.len().saturating_sub(80);
+        if start > 0 {
+            bubbles.drain(..start);
+        }
+    }
+}
+
+fn render_pair_bubbles(bubbles: &[PairBubble], current_session: Option<&str>) -> String {
+    if bubbles.is_empty() {
+        return r#"<p class="empty">まだ会話はありません。</p>"#.to_string();
+    }
+
+    let mut html = String::new();
+    for bubble in bubbles {
+        let (kind, speaker) = if bubble.kind == "web" {
+            if bubble
+                .owner_session
+                .as_deref()
+                .zip(current_session)
+                .is_some_and(|(owner, current)| owner == current)
+            {
+                ("self", "自分")
+            } else {
+                ("other", "他人")
+            }
+        } else {
+            (bubble.kind.as_str(), bubble.speaker.as_str())
+        };
+        html.push_str(&format!(
+            r#"<article class="bubble {}"><div class="speaker">{}</div><div class="text">{}</div></article>"#,
+            html_escape(kind),
+            html_escape(speaker),
+            html_escape(&bubble.body)
+        ));
+    }
+    html
+}
+
+fn pair_form_page(
+    latest_text: Option<&str>,
+    pair_bubbles: &[PairBubble],
+    current_session: Option<&str>,
+    oss_url: &str,
+    _token: &str,
+) -> String {
     let latest = latest_text
         .map(html_escape)
         .unwrap_or_else(|| "まだ入力はありません。".to_string());
     let oss_url = html_escape(oss_url);
-    let submit_path = html_escape(&pair_submit_path(token));
+    let submit_path = html_escape("/submit");
+    let state_path = html_escape("/state");
+    let bubbles = render_pair_bubbles(pair_bubbles, current_session);
+
+    format!(
+        r#"<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>檸檬烯姐智慧板</title>
+<style>
+body {{ font-family: system-ui, sans-serif; margin: 0; line-height: 1.5; background: #f6f7f8; color: #17202a; }}
+main {{ max-width: 760px; margin: 0 auto; padding: 16px; }}
+textarea {{ box-sizing: border-box; width: 100%; min-height: 120px; font-size: 18px; border: 1px solid #b8c0cc; border-radius: 8px; padding: 12px; }}
+button {{ width: 100%; margin-top: 10px; padding: 14px; font-size: 18px; border: 0; border-radius: 8px; background: #0b67d1; color: #fff; font-weight: 700; }}
+.timeline {{ display: flex; flex-direction: column; gap: 10px; margin: 18px 0; }}
+.bubble {{ max-width: 86%; padding: 10px 12px; border-radius: 8px; white-space: pre-wrap; box-shadow: 0 1px 2px rgba(0,0,0,.08); }}
+.bubble.cli {{ align-self: flex-start; background: #dcecff; border: 1px solid #a9cdf8; }}
+.bubble.self {{ align-self: flex-end; background: #dff5e4; border: 1px solid #a8d9b2; }}
+.bubble.other {{ align-self: flex-start; background: #eeeeee; border: 1px solid #d0d0d0; }}
+.speaker {{ font-size: 13px; font-weight: 700; margin-bottom: 4px; color: #34495e; }}
+.text {{ font-size: 17px; }}
+.latest, .empty {{ white-space: pre-wrap; padding: 12px; border: 1px solid #d0d0d0; border-radius: 8px; background: #fff; }}
+.oss {{ margin-top: 20px; padding: 14px; border: 1px solid #d0d0d0; border-radius: 8px; background: #fff; }}
+.oss a {{ display: block; margin-top: 8px; font-size: 18px; font-weight: 700; }}
+</style>
+</head>
+<body>
+<main>
+<h1>檸檬烯姐智慧板</h1>
+<p>請輸入中文。送出後會自動翻譯，下面可以追蹤對話。</p>
+<form method="post" action="{submit_path}">
+<textarea name="text" autofocus placeholder="請在這裡輸入中文"></textarea>
+<button type="submit">送出</button>
+</form>
+<h2>對話</h2>
+<section id="timeline" class="timeline">{bubbles}</section>
+<h2>最新輸入</h2>
+<div id="latest" class="latest">{latest}</div>
+<section class="oss">
+<h2>りもこのOSSまとめ</h2>
+<p>ROCm、本地 LLM、MCP Agent、日本語 LLM 評測、開源基礎設施工具。</p>
+<a href="{oss_url}" target="_blank" rel="noopener noreferrer">Open tools for local AI / 為本地 AI 打造開源工具</a>
+</section>
+</main>
+<script>
+const stateUrl = "{state_path}";
+async function refreshState() {{
+  try {{
+    const res = await fetch(stateUrl, {{ cache: "no-store" }});
+    if (!res.ok) return;
+    const state = await res.json();
+    const timeline = document.getElementById("timeline");
+    const latest = document.getElementById("latest");
+    if (timeline && state.timeline_html !== undefined) timeline.innerHTML = state.timeline_html;
+    if (latest && state.latest_html !== undefined) latest.innerHTML = state.latest_html;
+  }} catch (_) {{}}
+}}
+setInterval(refreshState, 700);
+refreshState();
+document.addEventListener("visibilitychange", () => {{
+  if (!document.hidden) refreshState();
+}});
+</script>
+</body>
+</html>"#
+    )
+}
+
+fn pair_state_json(
+    latest_text: Option<&str>,
+    pair_bubbles: &[PairBubble],
+    current_session: Option<&str>,
+) -> String {
+    json!({
+        "timeline_html": render_pair_bubbles(pair_bubbles, current_session),
+        "latest_html": latest_text
+            .map(html_escape)
+            .unwrap_or_else(|| "まだ入力はありません。".to_string()),
+    })
+    .to_string()
+}
+
+fn pair_auth_page(_token: &str, message: Option<&str>) -> String {
+    let auth_path = html_escape("/auth");
+    let message = message
+        .map(|text| format!(r#"<p class="message">{}</p>"#, html_escape(text)))
+        .unwrap_or_default();
 
     format!(
         r#"<!doctype html>
@@ -804,35 +1240,42 @@ fn pair_form_page(latest_text: Option<&str>, oss_url: &str, token: &str) -> Stri
 <title>檸檬烯姐智慧板</title>
 <style>
 body {{ font-family: system-ui, sans-serif; margin: 24px; line-height: 1.5; }}
-textarea {{ box-sizing: border-box; width: 100%; min-height: 160px; font-size: 18px; }}
+input {{ box-sizing: border-box; width: 100%; padding: 14px; font-size: 24px; letter-spacing: 0; }}
 button {{ width: 100%; margin-top: 12px; padding: 14px; font-size: 18px; }}
-.latest {{ white-space: pre-wrap; padding: 12px; border: 1px solid #ccc; }}
-.oss {{ margin-top: 24px; padding: 16px; border: 1px solid #bbb; }}
-.oss a {{ display: block; margin-top: 8px; font-size: 18px; font-weight: 700; }}
+.message {{ padding: 12px; border: 1px solid #ccc; }}
 </style>
 </head>
 <body>
 <h1>檸檬烯姐智慧板</h1>
-<p>請用你的手機輸入中文。りもこ這邊會翻譯成日文。</p>
-<form method="post" action="{submit_path}">
-<textarea name="text" autofocus placeholder="請在這裡輸入中文"></textarea>
-<button type="submit">送出</button>
+<p>請輸入りもこ CLI 用 /auth 顯示的8位數字。認證後可以直接送出中文，CLI會自動翻譯。</p>
+{message}
+<form method="post" action="{auth_path}">
+<input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" pattern="[0-9]{{8}}" autofocus>
+<button type="submit">認證</button>
 </form>
-<h2>最新輸入</h2>
-<div class="latest">{latest}</div>
-<section class="oss">
-<h2>りもこのOSSまとめ</h2>
-<p>ROCm、本地 LLM、MCP Agent、日本語 LLM 評測、開源基礎設施工具。</p>
-<a href="{oss_url}" target="_blank" rel="noopener noreferrer">Open tools for local AI / 為本地 AI 打造開源工具</a>
-</section>
 </body>
 </html>"#
     )
 }
 
 fn write_http_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
+    write_http_response_with_headers(stream, status, content_type, &[], body);
+}
+
+fn write_http_response_with_headers(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    headers: &[String],
+    body: &str,
+) {
+    let extra_headers = if headers.is_empty() {
+        String::new()
+    } else {
+        format!("{}\r\n", headers.join("\r\n"))
+    };
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}; charset=utf-8\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(response.as_bytes());
@@ -848,15 +1291,22 @@ fn request_method_path(request_line: &str) -> Option<(&str, &str)> {
 fn handle_pair_client(
     mut stream: TcpStream,
     latest_partner_input: Arc<Mutex<Option<String>>>,
+    pair_auth: Arc<Mutex<OneTimeAuth>>,
+    pair_bubbles: Arc<Mutex<Vec<PairBubble>>>,
     oss_url: String,
     token: String,
-    input_tx: Sender<String>,
+    input_tx: Sender<PairInput>,
 ) -> io::Result<()> {
+    let client_id = stream
+        .peer_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
 
     let mut content_length = 0usize;
+    let mut cookie_header = None;
     loop {
         let mut header = String::new();
         reader.read_line(&mut header)?;
@@ -865,8 +1315,12 @@ fn handle_pair_client(
             break;
         }
 
-        if let Some(value) = header_trimmed.strip_prefix("Content-Length:") {
-            content_length = value.trim().parse().unwrap_or(0);
+        if let Some((name, value)) = header_trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("Content-Length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("Cookie") {
+                cookie_header = Some(value.trim().to_string());
+            }
         }
     }
 
@@ -875,6 +1329,12 @@ fn handle_pair_client(
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
+    };
+    let bubbles = || {
+        pair_bubbles
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     };
 
     let (method, path) = match request_method_path(&request_line) {
@@ -888,36 +1348,161 @@ fn handle_pair_client(
     let page_path = pair_page_path(&token);
     let page_path_slash = format!("{page_path}/");
     let submit_path = pair_submit_path(&token);
+    let auth_path = pair_auth_path(&token);
+    let auth_path_slash = format!("{auth_path}/");
+    let state_path = pair_state_path(&token);
+    let state_path_slash = format!("{state_path}/");
+    let authenticated = pair_auth
+        .lock()
+        .map(|mut auth| auth.is_session_authenticated(cookie_header.as_deref()))
+        .unwrap_or(false);
+    let current_session = cookie_value(cookie_header.as_deref(), PAIR_SESSION_COOKIE);
 
-    if method == "GET" && (path == "/" || path == page_path || path == page_path_slash) {
-        let page = pair_form_page(latest_text().as_deref(), &oss_url, &token);
+    if method == "GET"
+        && (path == "/"
+            || path == "/auth"
+            || path == page_path
+            || path == page_path_slash
+            || path == auth_path
+            || path == auth_path_slash)
+    {
+        if !authenticated {
+            let page = pair_auth_page(&token, None);
+            write_http_response(&mut stream, "200 OK", "text/html", &page);
+            return Ok(());
+        }
+
+        let page = pair_form_page(
+            latest_text().as_deref(),
+            &bubbles(),
+            current_session.as_deref(),
+            &oss_url,
+            &token,
+        );
         write_http_response(&mut stream, "200 OK", "text/html", &page);
         return Ok(());
     }
 
+    if method == "GET" && (path == "/state" || path == state_path || path == state_path_slash) {
+        if !authenticated {
+            write_http_response(
+                &mut stream,
+                "401 Unauthorized",
+                "application/json",
+                r#"{"error":"unauthorized"}"#,
+            );
+            return Ok(());
+        }
+
+        let body = pair_state_json(
+            latest_text().as_deref(),
+            &bubbles(),
+            current_session.as_deref(),
+        );
+        write_http_response(&mut stream, "200 OK", "application/json", &body);
+        return Ok(());
+    }
+
+    if method == "POST" && (path == "/auth" || path == auth_path || path == auth_path_slash) {
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body)?;
+        let body = String::from_utf8_lossy(&body);
+        let code = parse_form_onetime_code(&body).unwrap_or_default();
+
+        let result = pair_auth
+            .lock()
+            .map(|mut auth| auth.verify_code(&code, &client_id))
+            .unwrap_or(OneTimeAuthResult::Invalid);
+
+        match result {
+            OneTimeAuthResult::Success {
+                session_id,
+                max_age_secs,
+            } => {
+                let page = pair_form_page(
+                    latest_text().as_deref(),
+                    &bubbles(),
+                    Some(&session_id),
+                    &oss_url,
+                    &token,
+                );
+                let cookie = format!(
+                    "Set-Cookie: {PAIR_SESSION_COOKIE}={session_id}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age_secs}"
+                );
+                write_http_response_with_headers(
+                    &mut stream,
+                    "200 OK",
+                    "text/html",
+                    &[cookie],
+                    &page,
+                );
+            }
+            OneTimeAuthResult::Locked { retry_after_secs } => {
+                let message =
+                    format!("失敗が多すぎます。{retry_after_secs}秒後に再試行してください。");
+                let page = pair_auth_page(&token, Some(&message));
+                write_http_response(&mut stream, "429 Too Many Requests", "text/html", &page);
+            }
+            OneTimeAuthResult::Invalid => {
+                let page = pair_auth_page(
+                    &token,
+                    Some(
+                        "8桁の数字が違うか、期限切れです。CLIで /auth を実行して確認してください。",
+                    ),
+                );
+                write_http_response(&mut stream, "401 Unauthorized", "text/html", &page);
+            }
+        }
+
+        return Ok(());
+    }
+
     if method == "POST" && (path == "/submit" || path == submit_path) {
+        if !authenticated {
+            let page = pair_auth_page(&token, Some("先に8桁の数字で認証してください。"));
+            write_http_response(&mut stream, "401 Unauthorized", "text/html", &page);
+            return Ok(());
+        }
+
         let mut body = vec![0; content_length];
         reader.read_exact(&mut body)?;
         let body = String::from_utf8_lossy(&body);
 
         let message = if let Some(text) = parse_form_text(&body) {
+            let speaker = pair_speaker_label(current_session.as_deref(), &client_id);
             if let Ok(mut latest) = latest_partner_input.lock() {
                 *latest = Some(text.clone());
             }
-            let _ = input_tx.send(text.clone());
+            push_pair_bubble(
+                &pair_bubbles,
+                "自分",
+                "web",
+                current_session.clone(),
+                text.clone(),
+            );
+            let _ = input_tx.send(PairInput {
+                speaker: speaker.clone(),
+                text: text.clone(),
+            });
             println!();
-            println!("[pair] WebUI input received:");
+            println!("[pair:{speaker}] WebUI input received:");
             println!("{text}");
-            println!("[pair] CLIに自動送信しました。");
+            println!("[pair] 自動で日本語翻訳します。/you は不要です。");
             let _ = io::stdout().flush();
-            "收到！CLIへ送信しました。"
+            "收到！會自動翻譯。"
         } else {
             "沒有收到文字，請再試一次。"
         };
 
         let page = format!(
             "{}<p><strong>{}</strong></p>",
-            pair_form_page(latest_text().as_deref(), &oss_url, &token),
+            pair_form_page(
+                latest_text().as_deref(),
+                &bubbles(),
+                current_session.as_deref(),
+                &oss_url,
+                &token,
+            ),
             html_escape(message)
         );
         write_http_response(&mut stream, "200 OK", "text/html", &page);
@@ -931,7 +1516,9 @@ fn handle_pair_client(
 fn start_pair_server(
     cfg: &Config,
     latest_partner_input: Arc<Mutex<Option<String>>>,
-    input_tx: Sender<String>,
+    pair_auth: Arc<Mutex<OneTimeAuth>>,
+    pair_bubbles: Arc<Mutex<Vec<PairBubble>>>,
+    input_tx: Sender<PairInput>,
 ) -> Result<PairServer> {
     let bind_addr = format!("{}:{}", cfg.pair_host, cfg.pair_port);
     let listener = TcpListener::bind(&bind_addr)
@@ -973,6 +1560,8 @@ fn start_pair_server(
             match stream {
                 Ok(stream) => {
                     let latest_partner_input = Arc::clone(&latest_partner_input);
+                    let pair_auth = Arc::clone(&pair_auth);
+                    let pair_bubbles = Arc::clone(&pair_bubbles);
                     let oss_url = oss_url.clone();
                     let token = token.clone();
                     let input_tx = input_tx.clone();
@@ -980,6 +1569,8 @@ fn start_pair_server(
                         let _ = handle_pair_client(
                             stream,
                             latest_partner_input,
+                            pair_auth,
+                            pair_bubbles,
                             oss_url,
                             token,
                             input_tx,
@@ -1055,6 +1646,8 @@ fn print_help(backend: Backend, mode: Mode, cfg: &Config) {
     println!("  /export md        履歴を zuttomo-history.md に出力");
     println!("  /aa               起動バナーAAを表示");
     println!("  /pair             相手スマホ入力フォームを起動");
+    println!("  /auth             WebUI認証用の8桁コードを表示");
+    println!("  /onetime          /auth の旧名");
     println!("  /exit, /quit      終了");
     println!();
     println!("env:");
@@ -1069,6 +1662,22 @@ fn print_help(backend: Backend, mode: Mode, cfg: &Config) {
     println!("  ZUTTOMO_PAIR_HOST={}", cfg.pair_host);
     println!("  ZUTTOMO_PAIR_PORT={}", cfg.pair_port);
     println!("  ZUTTOMO_PAIR_PUBLIC_URL={}", cfg.pair_public_url);
+    println!(
+        "  ZUTTOMO_PAIR_ONETIME_TTL_SECS={}",
+        cfg.pair_onetime_ttl_secs
+    );
+    println!(
+        "  ZUTTOMO_PAIR_SESSION_TTL_SECS={}",
+        cfg.pair_session_ttl_secs
+    );
+    println!(
+        "  ZUTTOMO_PAIR_AUTH_MAX_ATTEMPTS={}",
+        cfg.pair_auth_max_attempts
+    );
+    println!(
+        "  ZUTTOMO_PAIR_AUTH_LOCKOUT_SECS={}",
+        cfg.pair_auth_lockout_secs
+    );
     println!(
         "  ZUTTOMO_PAIR_TOKEN={}",
         if cfg.pair_token.is_some() {
@@ -1150,26 +1759,6 @@ fn print_backend_error(backend: Backend, error: &anyhow::Error) {
     println!();
 }
 
-fn run_turn(
-    cfg: &Config,
-    client: &Client,
-    backend: Backend,
-    history: &mut Vec<Message>,
-    mode: Mode,
-    input: &str,
-) -> Result<String> {
-    let answer = ask_backend(cfg, client, backend, history, mode, input)?;
-    let user_msg = Message::new("user", mode, input);
-    let assistant_msg = Message::new("assistant", mode, answer.clone());
-
-    append_history(&cfg.history_path, &user_msg)?;
-    append_history(&cfg.history_path, &assistant_msg)?;
-    history.push(user_msg);
-    history.push(assistant_msg);
-
-    Ok(answer)
-}
-
 fn run_turn_shared(
     cfg: &Config,
     client: &Client,
@@ -1198,24 +1787,6 @@ fn run_turn_shared(
     Ok(answer)
 }
 
-fn execute_turn(
-    cfg: &Config,
-    client: &Client,
-    backend: Backend,
-    history: &mut Vec<Message>,
-    mode: Mode,
-    input: &str,
-) {
-    match run_turn(cfg, client, backend, history, mode, input) {
-        Ok(answer) => {
-            println!();
-            println!("{answer}");
-            println!();
-        }
-        Err(error) => print_backend_error(backend, &error),
-    }
-}
-
 fn print_cli_usage() {
     println!("zuttomo 0.1.0");
     println!();
@@ -1227,7 +1798,35 @@ fn print_cli_usage() {
     println!();
     println!("inside REPL:");
     println!("  /tw TEXT, /me TEXT, /jp TEXT, /you [TEXT], /pobo TEXT");
-    println!("  /question [TEXT], /model [mi25|openrouter|codex], /pair");
+    println!("  /question [TEXT], /model [mi25|openrouter|codex], /pair, /auth");
+}
+
+fn print_auth_code(pair_auth: &Arc<Mutex<OneTimeAuth>>, cfg: &Config) {
+    match pair_auth.lock() {
+        Ok(auth) => {
+            let code = auth.current_code();
+            println!("auth code: {}", code.value);
+            println!(
+                "valid for {} seconds. WebUI sessions last up to {} hours.",
+                code.expires_in_secs,
+                cfg.pair_session_ttl_secs / 3600
+            );
+        }
+        Err(_) => println!("auth state is unavailable"),
+    }
+}
+
+fn repl_prompt(backend: Backend, mode: Mode) -> String {
+    format!("[{}:{}] ㄅㄆㄇㄈ> ", backend.name(), mode.name())
+}
+
+fn print_repl_prompt(backend: Backend, mode: Mode) -> io::Result<()> {
+    print!("{}", repl_prompt(backend, mode));
+    io::stdout().flush()
+}
+
+fn should_publish_to_pair(mode: Mode) -> bool {
+    matches!(mode, Mode::Chat | Mode::ToTaiwanMandarin)
 }
 
 fn run_repl() -> Result<()> {
@@ -1242,24 +1841,43 @@ fn run_repl() -> Result<()> {
     let mode = Arc::new(Mutex::new(Mode::Chat));
     let history = Arc::new(Mutex::new(load_history(&cfg.history_path)));
     let latest_partner_input = Arc::new(Mutex::new(None));
-    let (pair_tx, pair_rx) = mpsc::channel::<String>();
+    let pair_bubbles = Arc::new(Mutex::new(Vec::<PairBubble>::new()));
+    let pair_auth = Arc::new(Mutex::new(OneTimeAuth::new(
+        cfg.pair_onetime_ttl_secs,
+        cfg.pair_session_ttl_secs,
+        cfg.pair_auth_max_attempts,
+        cfg.pair_auth_lockout_secs,
+    )));
+    let (pair_tx, pair_rx) = mpsc::channel::<PairInput>();
     let mut pair_server: Option<PairServer> = None;
+    let mut line_editor =
+        rustyline::DefaultEditor::new().context("failed to initialize line editor")?;
 
     spawn_pair_translation_worker(
         cfg.clone(),
         client.clone(),
         Arc::clone(&backend),
+        Arc::clone(&mode),
         Arc::clone(&history),
         pair_rx,
     );
 
-    let initial_backend = backend.lock().map(|guard| *guard).unwrap_or(cfg.default_backend);
+    let initial_backend = backend
+        .lock()
+        .map(|guard| *guard)
+        .unwrap_or(cfg.default_backend);
     let initial_mode = mode.lock().map(|guard| *guard).unwrap_or(Mode::Chat);
     let initial_history_len = history.lock().map(|guard| guard.len()).unwrap_or(0);
     print_banner(initial_backend, initial_mode, initial_history_len);
 
     if cfg.pair_autostart {
-        match start_pair_server(&cfg, Arc::clone(&latest_partner_input), pair_tx.clone()) {
+        match start_pair_server(
+            &cfg,
+            Arc::clone(&latest_partner_input),
+            Arc::clone(&pair_auth),
+            Arc::clone(&pair_bubbles),
+            pair_tx.clone(),
+        ) {
             Ok(server) => {
                 println!("pair server auto-started:");
                 print_pair_server(&server);
@@ -1275,21 +1893,26 @@ fn run_repl() -> Result<()> {
     }
 
     loop {
-        let current_backend = backend.lock().map(|guard| *guard).unwrap_or(cfg.default_backend);
+        let current_backend = backend
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or(cfg.default_backend);
         let current_mode = mode.lock().map(|guard| *guard).unwrap_or(Mode::Chat);
-        print!("[{}:{}] ㄅㄆㄇㄈ> ", current_backend.name(), current_mode.name());
-        io::stdout().flush()?;
-
-        let mut line = String::new();
-        let n = io::stdin().read_line(&mut line)?;
-        if n == 0 {
-            break;
-        }
+        let line = match line_editor.readline(&repl_prompt(current_backend, current_mode)) {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => {
+                println!("^C");
+                continue;
+            }
+            Err(ReadlineError::Eof) => break,
+            Err(error) => bail!("failed to read CLI input: {error}"),
+        };
 
         let input = line.trim();
         if input.is_empty() {
             continue;
         }
+        let _ = line_editor.add_history_entry(input);
 
         if input == "/exit" || input == "/quit" {
             println!("檸檬烯姐、終了します。");
@@ -1303,6 +1926,11 @@ fn run_repl() -> Result<()> {
 
         if input == "/aa" {
             print_rimoko_aa();
+            continue;
+        }
+
+        if input == "/auth" || input == "/onetime" {
+            print_auth_code(&pair_auth, &cfg);
             continue;
         }
 
@@ -1371,7 +1999,13 @@ fn run_repl() -> Result<()> {
                 println!("pair server is already running:");
                 print_pair_server(server);
             } else {
-                match start_pair_server(&cfg, Arc::clone(&latest_partner_input), pair_tx.clone()) {
+                match start_pair_server(
+                    &cfg,
+                    Arc::clone(&latest_partner_input),
+                    Arc::clone(&pair_auth),
+                    Arc::clone(&pair_bubbles),
+                    pair_tx.clone(),
+                ) {
                     Ok(server) => {
                         println!("請用你的手機輸入中文。");
                         println!("我這邊會自動翻譯成日文。");
@@ -1394,14 +2028,11 @@ fn run_repl() -> Result<()> {
             if rest.is_empty() {
                 println!("mode switched: {}", Mode::Chat.name());
             } else {
-                execute_turn_shared(
-                    &cfg,
-                    &client,
-                    current_backend,
-                    &history,
-                    Mode::Chat,
-                    rest,
-                );
+                if let Some(answer) =
+                    execute_turn_shared(&cfg, &client, current_backend, &history, Mode::Chat, rest)
+                {
+                    push_pair_bubble(&pair_bubbles, "CLI話者", "cli", None, answer);
+                }
             }
             continue;
         }
@@ -1432,14 +2063,16 @@ fn run_repl() -> Result<()> {
             if rest.is_empty() {
                 println!("mode switched: {}", Mode::ToTaiwanMandarin.name());
             } else {
-                execute_turn_shared(
+                if let Some(answer) = execute_turn_shared(
                     &cfg,
                     &client,
                     current_backend,
                     &history,
                     Mode::ToTaiwanMandarin,
                     rest,
-                );
+                ) {
+                    push_pair_bubble(&pair_bubbles, "CLI話者", "cli", None, answer);
+                }
             }
             continue;
         }
@@ -1451,14 +2084,16 @@ fn run_repl() -> Result<()> {
             if rest.is_empty() {
                 println!("usage: /me TEXT");
             } else {
-                execute_turn_shared(
+                if let Some(answer) = execute_turn_shared(
                     &cfg,
                     &client,
                     current_backend,
                     &history,
                     Mode::ToTaiwanMandarin,
                     rest,
-                );
+                ) {
+                    push_pair_bubble(&pair_bubbles, "CLI話者", "cli", None, answer);
+                }
             }
             continue;
         }
@@ -1523,14 +2158,7 @@ fn run_repl() -> Result<()> {
             if rest.is_empty() {
                 println!("mode switched: {}", Mode::Pobo.name());
             } else {
-                execute_turn_shared(
-                    &cfg,
-                    &client,
-                    current_backend,
-                    &history,
-                    Mode::Pobo,
-                    rest,
-                );
+                execute_turn_shared(&cfg, &client, current_backend, &history, Mode::Pobo, rest);
             }
             continue;
         }
@@ -1541,7 +2169,18 @@ fn run_repl() -> Result<()> {
             continue;
         }
 
-        execute_turn_shared(&cfg, &client, current_backend, &history, current_mode, input);
+        if let Some(answer) = execute_turn_shared(
+            &cfg,
+            &client,
+            current_backend,
+            &history,
+            current_mode,
+            input,
+        ) {
+            if should_publish_to_pair(current_mode) {
+                push_pair_bubble(&pair_bubbles, "CLI話者", "cli", None, answer);
+            }
+        }
     }
 
     Ok(())
@@ -1575,14 +2214,18 @@ fn execute_turn_shared(
     history: &Arc<Mutex<Vec<Message>>>,
     mode: Mode,
     input: &str,
-) {
+) -> Option<String> {
     match run_turn_shared(cfg, client, backend, history, mode, input) {
         Ok(answer) => {
             println!();
             println!("{answer}");
             println!();
+            Some(answer)
         }
-        Err(error) => print_backend_error(backend, &error),
+        Err(error) => {
+            print_backend_error(backend, &error);
+            None
+        }
     }
 }
 
@@ -1590,20 +2233,28 @@ fn spawn_pair_translation_worker(
     cfg: Config,
     client: Client,
     backend: Arc<Mutex<Backend>>,
+    mode: Arc<Mutex<Mode>>,
     history: Arc<Mutex<Vec<Message>>>,
-    rx: mpsc::Receiver<String>,
+    rx: mpsc::Receiver<PairInput>,
 ) {
     thread::spawn(move || {
-        for text in rx {
-            let backend_now = backend.lock().map(|guard| *guard).unwrap_or(cfg.default_backend);
+        for input in rx {
+            let backend_now = backend
+                .lock()
+                .map(|guard| *guard)
+                .unwrap_or(cfg.default_backend);
+            println!();
+            println!("[pair:{}] 日本語訳:", input.speaker);
             execute_turn_shared(
                 &cfg,
                 &client,
                 backend_now,
                 &history,
                 Mode::ToJapanese,
-                &text,
+                &input.text,
             );
+            let mode_now = mode.lock().map(|guard| *guard).unwrap_or(Mode::Chat);
+            let _ = print_repl_prompt(backend_now, mode_now);
         }
     });
 }
@@ -1651,6 +2302,145 @@ mod tests {
     }
 
     #[test]
+    fn form_onetime_code_requires_eight_digits() {
+        assert_eq!(
+            parse_form_onetime_code("code=01234567").as_deref(),
+            Some("01234567")
+        );
+        assert_eq!(parse_form_onetime_code("code=1234567"), None);
+        assert_eq!(parse_form_onetime_code("code=1234567x"), None);
+    }
+
+    #[test]
+    fn auth_code_is_time_window_based_and_reusable() {
+        let mut auth = OneTimeAuth::with_secret(vec![7; 32], 90, 3600, 8, 60);
+        let code = auth.current_code_at(100);
+
+        assert_eq!(
+            auth.verify_code_at("00000000", "192.0.2.10", 101),
+            OneTimeAuthResult::Invalid
+        );
+
+        let result = auth.verify_code_at(&code.value, "192.0.2.10", 102);
+        assert!(matches!(result, OneTimeAuthResult::Success { .. }));
+        let result = auth.verify_code_at(&code.value, "192.0.2.11", 103);
+        assert!(matches!(result, OneTimeAuthResult::Success { .. }));
+
+        assert_eq!(
+            auth.verify_code_at(&code.value, "192.0.2.12", 180),
+            OneTimeAuthResult::Invalid
+        );
+    }
+
+    #[test]
+    fn onetime_auth_sets_cookie_session() {
+        let mut auth = OneTimeAuth::with_secret(vec![8; 32], 90, 3600, 8, 60);
+        let code = auth.current_code_at(100);
+        let result = auth.verify_code_at(&code.value, "192.0.2.10", 101);
+        let OneTimeAuthResult::Success { session_id, .. } = result else {
+            panic!("expected success");
+        };
+
+        let cookie = format!("theme=dark; {PAIR_SESSION_COOKIE}={session_id}");
+        assert!(auth.is_session_authenticated_at(Some(&cookie), 102));
+        assert!(!auth.is_session_authenticated_at(Some(&cookie), 3702));
+    }
+
+    #[test]
+    fn onetime_auth_locks_after_repeated_failures() {
+        let mut auth = OneTimeAuth::with_secret(vec![9; 32], 90, 3600, 2, 60);
+        let code = auth.current_code_at(100);
+
+        assert_eq!(
+            auth.verify_code_at("11111111", "192.0.2.10", 101),
+            OneTimeAuthResult::Invalid
+        );
+        assert_eq!(
+            auth.verify_code_at("22222222", "192.0.2.10", 102),
+            OneTimeAuthResult::Invalid
+        );
+        assert_eq!(
+            auth.verify_code_at(&code.value, "192.0.2.10", 103),
+            OneTimeAuthResult::Locked {
+                retry_after_secs: 59
+            }
+        );
+        assert!(matches!(
+            auth.verify_code_at(&code.value, "192.0.2.10", 163),
+            OneTimeAuthResult::Success { .. }
+        ));
+    }
+
+    #[test]
+    fn pair_bubbles_render_self_other_and_cli() {
+        let bubbles = vec![
+            PairBubble {
+                speaker: "自分".to_string(),
+                kind: "web".to_string(),
+                owner_session: Some("session-a".to_string()),
+                body: "我的問題".to_string(),
+            },
+            PairBubble {
+                speaker: "自分".to_string(),
+                kind: "web".to_string(),
+                owner_session: Some("session-b".to_string()),
+                body: "別人的問題".to_string(),
+            },
+            PairBubble {
+                speaker: "CLI話者".to_string(),
+                kind: "cli".to_string(),
+                owner_session: None,
+                body: "翻譯結果".to_string(),
+            },
+        ];
+
+        let html = render_pair_bubbles(&bubbles, Some("session-a"));
+        assert!(html.contains(r#"class="bubble self""#));
+        assert!(html.contains(r#"class="bubble other""#));
+        assert!(html.contains(r#"class="bubble cli""#));
+    }
+
+    #[test]
+    fn pair_state_json_contains_rendered_fragments() {
+        let bubbles = vec![PairBubble {
+            speaker: "CLI話者".to_string(),
+            kind: "cli".to_string(),
+            owner_session: None,
+            body: "翻譯結果".to_string(),
+        }];
+
+        let value: Value = serde_json::from_str(&pair_state_json(
+            Some("最新輸入"),
+            &bubbles,
+            Some("session-a"),
+        ))
+        .unwrap();
+        assert!(value["timeline_html"]
+            .as_str()
+            .unwrap()
+            .contains(r#"class="bubble cli""#));
+        assert_eq!(value["latest_html"], "最新輸入");
+    }
+
+    #[test]
+    fn pair_speaker_label_uses_session_short_id() {
+        assert_eq!(
+            pair_speaker_label(Some("abcdef123456"), "192.0.2.10"),
+            "相手 abcdef"
+        );
+        assert_eq!(pair_speaker_label(None, "192.0.2.10"), "相手 192.0.2.10");
+    }
+
+    #[test]
+    fn pair_publish_modes_are_partner_visible_only() {
+        assert!(should_publish_to_pair(Mode::Chat));
+        assert!(should_publish_to_pair(Mode::ToTaiwanMandarin));
+        assert!(!should_publish_to_pair(Mode::Question));
+        assert!(!should_publish_to_pair(Mode::ToJapanese));
+        assert!(!should_publish_to_pair(Mode::Pobo));
+    }
+
+    #[test]
     fn pair_url_adds_token_path() {
         assert_eq!(
             pair_url("https://pair.example.com/", "abc123"),
@@ -1668,5 +2458,21 @@ mod tests {
             request_method_path("GET /t/abc123?x=1 HTTP/1.1"),
             Some(("GET", "/t/abc123"))
         );
+    }
+
+    #[test]
+    fn pair_pages_use_stable_tokenless_form_paths() {
+        let page = pair_form_page(
+            None,
+            &[],
+            Some("session-a"),
+            "https://example.com",
+            "abc123",
+        );
+        assert!(page.contains(r#"action="/submit""#));
+        assert!(page.contains(r#"const stateUrl = "/state";"#));
+
+        let auth_page = pair_auth_page("abc123", None);
+        assert!(auth_page.contains(r#"action="/auth""#));
     }
 }
